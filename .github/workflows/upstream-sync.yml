@@ -1,0 +1,157 @@
+name: upstream-sync
+
+# 自动跟随上游：定时检查 czg86389-hub/muse2api 的最新版本，
+# 发现新版本就构建镜像推 GHCR，并同步产出离线 tar 到 Release。
+on:
+  schedule:
+    - cron: '23 */6 * * *'   # UTC 每 6 小时检查一次
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '强制构建指定上游版本（如 v1.6.6）；留空=自动探测上游最新'
+        required: false
+        default: ''
+
+permissions:
+  contents: write   # 建 tag / 发 Release
+  packages: write   # 推 GHCR
+
+env:
+  UPSTREAM: czg86389-hub/muse2api
+
+jobs:
+  resolve:
+    name: 探测上游版本
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.pick.outputs.version }}
+      need_build: ${{ steps.pick.outputs.need_build }}
+      image: ${{ steps.pick.outputs.image }}
+    steps:
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 取上游最新 tag 并比对本仓库已发布版本
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          IMG="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/muse2api"
+          echo "image=$IMG" >> "$GITHUB_OUTPUT"
+
+          UPSTREAM_LATEST=$(gh api "repos/${UPSTREAM}/tags" --paginate --jq '.[].name' \
+            | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          echo "上游最新版本: $UPSTREAM_LATEST"
+
+          VERSION="${FORCE_VERSION:-$UPSTREAM_LATEST}"
+          [ -n "$VERSION" ] || { echo "拿不到上游版本，退出"; exit 1; }
+          echo "本次目标版本: $VERSION"
+
+          if [ -z "$FORCE_VERSION" ] && docker manifest inspect "${IMG}:${VERSION}" >/dev/null 2>&1; then
+            echo "$IMG:$VERSION 已存在，无需重建"
+            NEED=false
+          else
+            echo "$IMG:$VERSION 不存在或强制重建，开始构建"
+            NEED=true
+          fi
+
+          echo "version=$VERSION"      >> "$GITHUB_OUTPUT"
+          echo "need_build=$NEED"      >> "$GITHUB_OUTPUT"
+
+      - name: 结果摘要
+        run: |
+          {
+            echo "### 上游同步检查"
+            echo "- 目标版本：\`${{ steps.pick.outputs.version }}\`"
+            echo "- 是否需要构建：\`${{ steps.pick.outputs.need_build }}\`"
+            echo "- 镜像：\`${{ steps.pick.outputs.image }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    name: 构建上游版本并推 GHCR
+    needs: resolve
+    if: needs.resolve.outputs.need_build == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 上游源码（指定 tag）
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.UPSTREAM }}
+          ref: ${{ needs.resolve.outputs.version }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ needs.resolve.outputs.image }}:${{ needs.resolve.outputs.version }}
+            ${{ needs.resolve.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Summary
+        run: |
+          {
+            echo "### 已推送到 GHCR"
+            echo '```'
+            echo "${{ needs.resolve.outputs.image }}:${{ needs.resolve.outputs.version }}"
+            echo "${{ needs.resolve.outputs.image }}:latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: 同步离线 tar 到 Release
+    needs: [resolve, build]
+    if: needs.resolve.outputs.need_build == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Login GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull & save
+        run: |
+          IMG="${{ needs.resolve.outputs.image }}"
+          TAG="${{ needs.resolve.outputs.version }}"
+          OUT="muse2api-${TAG}-linux-amd64.tar.gz"
+          docker pull "${IMG}:${TAG}"
+          docker save "${IMG}:${TAG}" | gzip -1 > "${OUT}"
+          sha256sum "${OUT}" > "${OUT}.sha256"
+          ls -lh
+          cat "${OUT}.sha256"
+
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve.outputs.version }}
+          name: ${{ needs.resolve.outputs.version }}
+          target_commitish: ${{ github.event.repository.default_branch }}
+          body: |
+            由 `upstream-sync` 自动构建，对应上游 [czg86389-hub/muse2api](https://github.com/czg86389-hub/muse2api) 的 `${{ needs.resolve.outputs.version }}`。
+
+            ```bash
+            docker pull ghcr.io/${{ github.repository_owner }}/muse2api:${{ needs.resolve.outputs.version }}
+            ```
+          files: |
+            muse2api-*.tar.gz
+            muse2api-*.tar.gz.sha256
+          fail_on_unmatched_files: true
