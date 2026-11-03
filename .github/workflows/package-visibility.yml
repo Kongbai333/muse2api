@@ -1,0 +1,36 @@
+name: set-package-public
+
+# 一次性把 GHCR 包可见性改成 public，这样任何机器 docker pull 都不需要登录
+on:
+  workflow_dispatch:
+    inputs:
+      visibility:
+        description: 'public 或 private'
+        required: true
+        default: 'public'
+
+permissions:
+  packages: write
+  contents: read
+
+jobs:
+  set-visibility:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Try PATCH user package
+        id: patch
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api --method PATCH "/user/packages/container/muse2api" -f visibility=${{ inputs.visibility }} && echo "patched=ok" || echo "patched=failed"
+
+      - name: Verify anonymous pull token
+        run: |
+          ANON=$(curl -s "https://ghcr.io/token?scope=repository:kongbai333/muse2api:pull&service=ghcr.io")
+          echo "$ANON" | head -c 200; echo
+          T=$(echo "$ANON" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("token",""))')
+          if [ -z "$T" ]; then echo "匿名 token 为空 -> 包仍是 private"; exit 0; fi
+          echo "anon token len=${#T}"
+          curl -s -o /dev/null -w "tags/list status: %{http_code}\n" -H "Authorization: Bearer $T" https://ghcr.io/v2/kongbai333/muse2api/tags/list
+          curl -s -H "Authorization: Bearer $T" https://ghcr.io/v2/kongbai333/muse2api/tags/list | head -c 300; echo
