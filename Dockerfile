@@ -12,7 +12,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
 WORKDIR /app
 
 # 安装 Chromium、中文字体与核心依赖
-RUN apt-get update && apt-get install -y --no-install-recommends \
+RUN apt-get update -o Acquire::Retries=8 && apt-get install -y -o Acquire::Retries=8 -o Acquire::http::Timeout=60 --no-install-recommends \
     chromium \
     fonts-wqy-zenhei \
     fonts-freefont-ttf \
